@@ -20,9 +20,9 @@ def range(iterable, start, end):
     return result
 
 def test_utils():
-    import datacoin
-    cf = datacoin.CryptoFiles('~/.datacoin')
-    utils = datacoin.CryptoFiles
+    import cryptofiles
+    cf = cryptofiles.CryptoFiles('~/.datacoin')
+    utils = cryptofiles.CryptoFiles
     assert index(utils.blockhashes(cf), 0) == '1d724e874ee9ea571563239bde095911f128db47c7612fb1968c08c9f95cabe8'
     assert range(utils.alltxids(cf), 0, 3) == [
         'fe5d7082c24c53362f6b82211913d536677aaffafde0dcec6ff7b348ff6265f8',
