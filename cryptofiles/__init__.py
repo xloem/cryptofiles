@@ -1,4 +1,4 @@
-from .cryptofiles import CryptoFiles
+from .cryptofiles import *
 
-__version__ = '0.1.0'
-__all__ = [CryptoFiles]
+__version__ = '0.1.1'
+__all__ = [CryptoFiles, Datacoin, BitcoinSV]
