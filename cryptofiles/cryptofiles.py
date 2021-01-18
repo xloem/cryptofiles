@@ -4,12 +4,14 @@ import decimal
 import json
 import os
 import requests
+import typing
 
 class CryptoFilesException(Exception):
     pass
 
 class CryptoFiles:
     def __init__(self, datadir='~/.datacoin', rpcurl='127.0.0.1:11777', rpcuser=None, rpcpassword=None, rpcport=None):
+        self._localparams = (datadir, rpcurl, rpcuser, rpcpassword, rpcport)
         if '://' in rpcurl:
             dummy, rpcurl = rpcurl.split('://', 1)
         if '/' in rpcurl:
@@ -37,7 +39,17 @@ class CryptoFiles:
         self.rpcuser = rpcuser
         self.rpcpassword = rpcpassword
         self.__session = None
-        self.genesis_hash, self.genesis_txid = next(self.allblocktxids())
+        self.chain_name, self.genesis_hash, self.genesis_txid = None, None, None
+
+    def identifiers(self):
+        if self.chain_name is None:
+            self.genesis_hash, self.genesis_txid = next(self.allblocktxids())
+            self.chain_name = self.rpc('getnetworkinfo')['subversion'][1:-1].split(':',1)[0]
+        return (
+            self.chain_name,
+            self.genesis_hash,
+            self.genesis_txid
+        )
 
     def rpc(self, apiname, *params):
         if self.__session is None:
@@ -51,9 +63,13 @@ class CryptoFiles:
         ).text
         result = json.loads(result, parse_float=decimal.Decimal)
         if result["error"] is not None:
-            raise CryptoFilesException(result['error'])
-        if 'result' not in result:
-            raise CryptoFilesException({'code': -343, 'message': 'missing JSON-RPC result'})
+            error = result['error']
+        elif 'result' not in result:
+            error = {'code': -343, 'message': 'missing JSON-RPC result'}
+        else:
+            error = None
+        if error is not None:
+            raise CryptoFilesException(error['message'], error, apiname, *params)
         return result['result']
 
     def blockhashes(self, startblock = 0):
@@ -87,7 +103,7 @@ class CryptoFiles:
         raise CryptoFilesException({'code': -9999, 'message': helpst})
 
     def __default_if_genesis_error(self, default, apiname, txid, *params):
-        if txid != self.genesis_txid:
+        if txid != self.identifiers()[2]:
             result = self.rpc(apiname, txid, *params)
             return result
         try:
@@ -130,7 +146,113 @@ class ChainData:
     txid : str
     blockhash : str
     type : str
+    filename : str = None
+    contenttype : str = None
+    parsed : typing.Any = None
+    
+    def __init__(self, chain : CryptoFiles, data : bytes, txid : str, blockhash : str, type : str):
+        self.chain = chain
+        self.data = data
+        self.txid = txid
+        self.blockhash = blockhash
+        self.type = type
+        self.parsed = None
+
+        try:
+            self.parsed = DatacoinEnvelope(self)
+        except Exception as e:
+            pass
+
+import os
+import sqlite3
+class Database:
+    def __init__(self, path, *chains):
+        os.makedirs(path)
+        self.db = sqlite3.connect(os.path.join(path, 'cryptofiles.db'))
+        self.db.execute('''
+            CREATE TABLE IF NOT EXISTS chains
+                 (id INT PRIMARY KEY, name text, genesis text, params text,
+                  CONSTRAINT UC_chains UNIQUE (name, genesis));
+        ''')
+        self.db.commit()
+        self.chains = {}
+        for chain in chains:
+            self.connect_chain(chain)
+        for id, name, genesis, params in self.db.execute('SELECT * FROM chains'):
+            if id in self.chains or params is None:
+                continue
+            chain = CryptoFiles(*params)
+            chainname, chaingenesis, chaintxid = chain.identifiers()
+            if name == chainname and genesis == chaingenesis:
+                self.chains[id] = chain
+            else:
+                self.db.execute('REPLACE INTO chains (params) VALUES (NULL) WHERE id = ?', id)
+        self.db.commit()
+    def connect_chain(self, chain):
+        name, genesis_blockhash, genesis_txid = chain.identifiers()
+        self.db.execute(
+            'REPLACE INTO chains (name, genesis, params) VALUES (?,?,?)',
+            name,
+            genesis_blockchash,
+            json.dumps(chain._localparams)
+        )
+        self.chains[self.db.last_insert_rowid()] = chain
+        self.db.commit()
         
+
+
+import bz2
+import hashlib
+import lzma
+import warnings
+from . import envelope_pb2
+@dataclasses.dataclass
+class DatacoinEnvelope:
+    data : bytes
+    ids : typing.List[str]
+    def __init__(self, chaindata):
+        self.envelope = envelope_pb2.Envelope()
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            self.envelope.ParseFromString(chaindata.data)
+        if not self.envelope.IsInitialized():
+            raise CryptoFilesException('complete datacoin envelope data not found')
+        # TotalParts, PartNumber
+        # PublicKey is file owner, may be different from transaction publisher, only on 1st part
+        # Signature proves PublicKey made file
+        # PrevDataHash is hash of first part that this file replaces, the value signed in the previous signature
+    @property
+    def data(self):
+        if self.envelope.Compression == self.envelope.CompressionMethod.Bzip2:
+            return bz2.decompress(self.envelope.Data)
+        elif self.envelope.Compression == self.envelope.CompressionMethod.Xz:
+            return lzma.decompress(self.envelope.Data)
+        else:
+            return self.envelope.Data
+    @property
+    def ids(self):
+        # envelope files are addressed by content hash, the value that is signed with the signmessage call.
+        return [hashlib.sha256(
+            bytes(self.envelope.FileName +
+            self.envelope.ContentType +
+            str(self.envelope.Compression) +
+            self.envelope.PublicKey +
+            str(self.envelope.PartNumber) +
+            str(self.envelope.TotalParts) +
+            self.envelope.PrevTxId +
+            self.envelope.PrevDataHash +
+            str(self.envelope.DateTime) +
+            str(self.envelope.version), 'utf-8') +
+            self.envelope.Data
+        ).hexdigest()]
+    def verify(self, chain : CryptoFiles):
+        # returns True or False
+        return chain.rpc('verifymessage', self.envelope.PublicKey, base64.b64encode(self.envelope.Signature), self.id())
+    def sign(self, chain : CryptoFiles):
+        sig = chain.rpc('signmessage', self.envelope.PublicKey, self.id())
+        self.envelope.Signature = base64.b64decode(sig)
+
+            
 class Datacoin(CryptoFiles):
     def __init__(self, datadir='~/.datacoin', rpcurl='127.0.0.1:11777', rpcuser=None, rpcpassword=None, rpcport=None):
         super().__init__(datadir, rpcurl, rpcuser, rpcpassword, rpcport)
