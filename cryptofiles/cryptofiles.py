@@ -72,9 +72,11 @@ class CryptoFiles:
             raise CryptoFilesException(error['message'], error, apiname, *params)
         return result['result']
 
-    def blockhashes(self, startblock = 0):
+    def blockhashes(self, startblock = 0, include = True):
         if type(startblock) is str:
             startblock = self.rpc('getblock', startblock)['height']
+        if not include:
+            startblock += 1
         height = startblock
         while height <= self.rpc('getblockcount'):
             hash = self.rpc('getblockhash', height)
@@ -85,11 +87,37 @@ class CryptoFiles:
             txid
             for txid in self.rpc('getblock', blockhash)['tx']
         )
-    def allblocktxids(self, startblock = 0):
+    def allblocktxids(self, startblock = 0, include = True):
         return (
             (blockhash, txid)
-            for blockhash in self.blockhashes(startblock)
+            for blockhash in self.blockhashes(startblock, include)
             for txid in self.blocktxids(blockhash)
+        )
+
+    def blockdatatype(self, datatype, block):
+        if datatype == 'getdata':
+            return self.blockgetdata(block)
+        else:
+            return []
+
+    def blockgetdata(self, blockhash):
+        if not self.has_getdata():
+            return []
+        if type(blockhash) is int:
+            blockhash = next(self.blockhashes(blockhash, True))
+        return (
+            ChainData(
+                self,
+                self.__error_to_return(base64.b64decode, data, None, True),
+                txid,
+                blockhash,
+                'getdata'
+            )
+            for data, txid in (
+                (self.__default_if_genesis_error('', 'getdata', txid), txid)
+                for txid in self.blocktxids(blockhash)
+            )
+            if len(data)
         )
 
     def __api_exists(self, name):
@@ -118,25 +146,24 @@ class CryptoFiles:
         except Exception as error:
             return error
 
+    DATATYPES = ['getdata']
+    IDTYPES = ['datacoin-envelope-0', 'datacoin-envelope-2']
+    VERSION = 1
+
+    def datatypes(self):
+        result = []
+        if self.has_getdata():
+            result.append('getdata')
+        return result
+
     def has_getdata(self):
         return self.__api_exists('getdata')
 
-    def allgetdata(self, startblock = 0):
-        if not self.has_getdata():
-            return []
+    def alldatatype(self, datatype, startblock = 0, include = True):
         return (
-            ChainData(
-                self,
-                self.__error_to_return(base64.b64decode, data, None, True),
-                txid,
-                blockhash,
-                'getdata'
-            )
-            for data, txid, blockhash in (
-                (self.__default_if_genesis_error('', 'getdata', txid), txid, blockhash)
-                for blockhash, txid in self.allblocktxids(startblock)
-            )
-            if len(data)
+            chaindata
+            for blockhash in self.blockhashes(startblock, include)
+            for chaindata in self.blockdatatype(datatype, blockhash)
         )
 
 @dataclasses.dataclass
@@ -146,10 +173,10 @@ class ChainData:
     txid : str
     blockhash : str
     type : str
-    filename : str = None
+    #filename : str = None
     contenttype : str = None
     parsed : typing.Any = None
-    
+
     def __init__(self, chain : CryptoFiles, data : bytes, txid : str, blockhash : str, type : str):
         self.chain = chain
         self.data = data
@@ -165,39 +192,94 @@ class ChainData:
 
 import os
 import sqlite3
+import threading
 class Database:
     def __init__(self, path, *chains):
-        os.makedirs(path)
-        self.db = sqlite3.connect(os.path.join(path, 'cryptofiles.db'))
-        self.db.execute('''
-            CREATE TABLE IF NOT EXISTS chains
-                 (id INT PRIMARY KEY, name text, genesis text, params text,
-                  CONSTRAINT UC_chains UNIQUE (name, genesis));
-        ''')
-        self.db.commit()
+        os.makedirs(path, exist_ok=True)
+        self.filename = os.path.join(path, 'cryptofiles.db')
+        with self.connection() as db:
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS `chains`
+                    (id INT PRIMARY KEY, name TEXT, genesis TEXT, params TEXT, version INT,
+                     CONSTRAINT UC_chains UNIQUE (name, genesis)
+                    );
+                CREATE TABLE IF NOT EXISTS `index`
+                    (id TEXT, chain INT, block TEXT, txid TEXT, filename TEXT, idtype TEXT, datatype TEXT,
+                     CONSTRAINT PK_index PRIMARY KEY (id, chain)
+                    );
+            ''')
         self.chains = {}
+        self.threads = {}
         for chain in chains:
             self.connect_chain(chain)
-        for id, name, genesis, params in self.db.execute('SELECT * FROM chains'):
-            if id in self.chains or params is None:
-                continue
-            chain = CryptoFiles(*params)
-            chainname, chaingenesis, chaintxid = chain.identifiers()
-            if name == chainname and genesis == chaingenesis:
-                self.chains[id] = chain
-            else:
-                self.db.execute('REPLACE INTO chains (params) VALUES (NULL) WHERE id = ?', id)
-        self.db.commit()
+        with self.connection() as db:
+            for id, name, genesis, params, version in db.execute('SELECT * FROM chains'):
+                if id in self.chains or params is None:
+                    continue
+                chain = CryptoFiles(*json.loads(params))
+                chainname, chaingenesis, chaintxid = chain.identifiers()
+                if name == chainname and genesis == chaingenesis:
+                    self.connect_chain(chain)
+                else:
+                    db.execute('REPLACE INTO `chains` (params) VALUES (NULL) WHERE id = ?', id)
+    def connection(self):
+        return sqlite3.connect(self.filename)
     def connect_chain(self, chain):
         name, genesis_blockhash, genesis_txid = chain.identifiers()
-        self.db.execute(
-            'REPLACE INTO chains (name, genesis, params) VALUES (?,?,?)',
-            name,
-            genesis_blockchash,
-            json.dumps(chain._localparams)
-        )
-        self.chains[self.db.last_insert_rowid()] = chain
-        self.db.commit()
+        with self.connection() as db:
+            result = db.execute(
+                'SELECT id, params, version FROM `chains` WHERE name = ? AND genesis = ?',
+                (name, genesis_blockhash)
+            ).fetchone()
+            if result is None:
+                cursor = db.cursor()
+                cursor.execute(
+                    'INSERT INTO `chains` (name, genesis, params, version) VALUES (?,?,?,?)',
+                    (name, genesis_blockhash, json.dumps(chain._localparams), chain.VERSION)
+                )
+                dbid = cursor.lastrowid
+                dbversion = chain.VERSION
+            else:
+                dbid, dbparams, dbversion = result
+                if dbparams != json.dumps(chain._localparams):
+                    db.execute(
+                        'UPDATE `chains` SET params = ? WHERE id = ?',
+                        (json.dumps(chain._localparams), dbid)
+                    )
+        self.chains[dbid] = {
+            'threads': {},
+            'chain': chain
+        }
+        for datatype in chain.DATATYPES:
+            thread = threading.Thread(target=self._run(dbid, datatype))
+            self.chains[dbid]['threads'][datatype] = thread
+            thread.start()
+    def _run(self, dbid, datatype):
+        def run():
+            chain = self.chains[dbid]['chain']
+            startpos = -1
+            with self.connection() as db:
+                last = db.execute('SELECT block FROM `index` WHERE chain = ? AND datatype = ? ORDER BY id DESC LIMIT 1', (dbid, datatype)).fetchone()
+            if last is not None:
+                startpos = last
+            # change to each block, 1 transaction
+            for blockhash in chain.blockhashes(startpos, False):
+                values = []
+                for data in chain.blockdatatype(datatype, blockhash):
+                    filename = None
+                    if data.parsed is not None:
+                        filename = data.parsed.filename
+                    values.append([data.txid, dbid, data.blockhash, data.txid,  filename, 'txid', datatype])
+                    if data.parsed is not None:
+                        for name, value in data.parsed.ids.items():
+                            values.append([value, dbid, data.blockhash, data.txid, filename, name, datatype])
+                        ids.extend(data.parsed.ids)
+                if len(values):
+                    for value in values:
+                        print(value)
+                    with self.connection() as db:
+                            db.executemany('INSERT INTO `index` (id, chain, block, txid, filename, idtype, datatype) VALUES (?,?,?,?,?,?,?)', values)
+        return run
         
 
 
@@ -205,12 +287,15 @@ import bz2
 import hashlib
 import lzma
 import warnings
-from . import envelope_pb2
+
+import envelope_pb2
 @dataclasses.dataclass
 class DatacoinEnvelope:
     data : bytes
     ids : typing.List[str]
     def __init__(self, chaindata):
+        # this could store a reference to the chaindata, and not its copy, and generate.
+        # maybe static function would serialise into its format
         self.envelope = envelope_pb2.Envelope()
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
@@ -230,21 +315,29 @@ class DatacoinEnvelope:
         else:
             return self.envelope.Data
     @property
+    def filename(self):
+        return self.envelope.FileName
+    @property
     def ids(self):
         # envelope files are addressed by content hash, the value that is signed with the signmessage call.
-        return [hashlib.sha256(
-            bytes(self.envelope.FileName +
-            self.envelope.ContentType +
-            str(self.envelope.Compression) +
-            self.envelope.PublicKey +
-            str(self.envelope.PartNumber) +
-            str(self.envelope.TotalParts) +
-            self.envelope.PrevTxId +
-            self.envelope.PrevDataHash +
-            str(self.envelope.DateTime) +
-            str(self.envelope.version), 'utf-8') +
-            self.envelope.Data
-        ).hexdigest()]
+        result = {}
+        if self.envelope.version == 2:
+            result['datacoin-envelope-2'] = hashlib.sha256(
+                bytes(self.envelope.FileName +
+                self.envelope.ContentType +
+                str(self.envelope.Compression) +
+                self.envelope.PublicKey +
+                str(self.envelope.PartNumber) +
+                str(self.envelope.TotalParts) +
+                self.envelope.PrevTxId +
+                self.envelope.PrevDataHash +
+                str(self.envelope.DateTime) +
+                str(self.envelope.version), 'utf-8') +
+                self.envelope.Data
+            ).hexdigest()
+        # the older envelope format just hashed the data, not the envelope
+        result['datacoin-envelope-0'] = hashlib.sha256(self.envelope.Data).hexdigest()
+        return resulg
     def verify(self, chain : CryptoFiles):
         # returns True or False
         return chain.rpc('verifymessage', self.envelope.PublicKey, base64.b64encode(self.envelope.Signature), self.id())
@@ -260,3 +353,4 @@ class Datacoin(CryptoFiles):
 class BitcoinSV(CryptoFiles):
     def __init__(self, datadir='~/.bitcoin.sv', rpcurl='127.0.0.1:8332', rpcuser=None, rpcpassword=None, rpcport=None):
         super().__init__(datadir, rpcurl, rpcuser, rpcpassword, rpcport)
+
