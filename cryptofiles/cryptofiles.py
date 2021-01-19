@@ -159,6 +159,9 @@ class CryptoFiles:
     def has_getdata(self):
         return self.__api_exists('getdata')
 
+    def has_senddata(self):
+        return self.__api_exists('senddata')
+
     def alldatatype(self, datatype, startblock = 0, include = True):
         return (
             chaindata
@@ -185,10 +188,11 @@ class ChainData:
         self.type = type
         self.parsed = None
 
-        try:
-            self.parsed = DatacoinEnvelope(self)
-        except Exception as e:
-            pass
+        for Format in (DatacoinEnvelope, BZ2):
+            try:
+                self.parsed = Format(self)
+            except Exception as e:
+                pass
 
 import os
 import sqlite3
@@ -273,7 +277,6 @@ class Database:
                     if data.parsed is not None:
                         for name, value in data.parsed.ids.items():
                             values.append([value, dbid, data.blockhash, data.txid, filename, name, datatype])
-                        ids.extend(data.parsed.ids)
                 if len(values):
                     for value in values:
                         print(value)
@@ -288,62 +291,82 @@ import hashlib
 import lzma
 import warnings
 
-import envelope_pb2
+@dataclasses.dataclass
+class BZ2:
+    data : bytes
+    ids : typing.Iterable[str] = ()
+    filename : str = None
+    def __init__(self, chaindata):
+        self.chaindata = chaindata
+        data = self.data
+    @property
+    def data(self):
+        return bz2.decompress(self.chaindata.data)
+
+from . import envelope_pb2
 @dataclasses.dataclass
 class DatacoinEnvelope:
     data : bytes
     ids : typing.List[str]
+    filename : str
     def __init__(self, chaindata):
-        # this could store a reference to the chaindata, and not its copy, and generate.
-        # maybe static function would serialise into its format
-        self.envelope = envelope_pb2.Envelope()
+        self.chaindata = chaindata
+        envelope = self._envelope
+    @property
+    def _envelope(self):
+        envelope = envelope_pb2.Envelope()
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
-            self.envelope.ParseFromString(chaindata.data)
-        if not self.envelope.IsInitialized():
+            envelope.ParseFromString(self.chaindata.data)
+        if not envelope.IsInitialized():
             raise CryptoFilesException('complete datacoin envelope data not found')
         # TotalParts, PartNumber
         # PublicKey is file owner, may be different from transaction publisher, only on 1st part
         # Signature proves PublicKey made file
         # PrevDataHash is hash of first part that this file replaces, the value signed in the previous signature
+        return envelope
     @property
     def data(self):
-        if self.envelope.Compression == self.envelope.CompressionMethod.Bzip2:
-            return bz2.decompress(self.envelope.Data)
-        elif self.envelope.Compression == self.envelope.CompressionMethod.Xz:
-            return lzma.decompress(self.envelope.Data)
+        envelope = self._envelope
+        if envelope.Compression == envelope.CompressionMethod.Bzip2:
+            return bz2.decompress(envelope.Data)
+        elif envelope.Compression == envelope.CompressionMethod.Xz:
+            return lzma.decompress(envelope.Data)
         else:
-            return self.envelope.Data
+            return envelope.Data
     @property
     def filename(self):
-        return self.envelope.FileName
+        return self._envelope.FileName
     @property
     def ids(self):
         # envelope files are addressed by content hash, the value that is signed with the signmessage call.
         result = {}
-        if self.envelope.version == 2:
+        envelope = self._envelope
+        if envelope.version == 2:
             result['datacoin-envelope-2'] = hashlib.sha256(
-                bytes(self.envelope.FileName +
-                self.envelope.ContentType +
-                str(self.envelope.Compression) +
-                self.envelope.PublicKey +
-                str(self.envelope.PartNumber) +
-                str(self.envelope.TotalParts) +
-                self.envelope.PrevTxId +
-                self.envelope.PrevDataHash +
-                str(self.envelope.DateTime) +
-                str(self.envelope.version), 'utf-8') +
-                self.envelope.Data
+                bytes(envelope.FileName +
+                envelope.ContentType +
+                str(envelope.Compression) +
+                envelope.PublicKey +
+                str(envelope.PartNumber) +
+                str(envelope.TotalParts) +
+                envelope.PrevTxId +
+                envelope.PrevDataHash +
+                str(envelope.DateTime) +
+                str(envelope.version), 'utf-8') +
+                envelope.Data
             ).hexdigest()
         # the older envelope format just hashed the data, not the envelope
-        result['datacoin-envelope-0'] = hashlib.sha256(self.envelope.Data).hexdigest()
-        return resulg
+        result['datacoin-envelope-0'] = hashlib.sha256(envelope.Data).hexdigest()
+        return result
     def verify(self, chain : CryptoFiles):
         # returns True or False
-        return chain.rpc('verifymessage', self.envelope.PublicKey, base64.b64encode(self.envelope.Signature), self.id())
+        envelope = self._envelope
+        return chain.rpc('verifymessage', envelope.PublicKey, base64.b64encode(envelope.Signature), self.id())
     def sign(self, chain : CryptoFiles):
-        sig = chain.rpc('signmessage', self.envelope.PublicKey, self.id())
-        self.envelope.Signature = base64.b64decode(sig)
+        envelope = self._envelope
+        sig = chain.rpc('signmessage', envelope.PublicKey, self.id())
+        envelope.Signature = base64.b64decode(sig)
 
             
 class Datacoin(CryptoFiles):
